@@ -73,9 +73,7 @@ export class ElmAnalyseDiagnostics {
     // each file and sends them as a batch
     const diagnostics: Map<string, Diagnostic[]> = report.messages.reduce(
       (acc, message) => {
-        const filePath =
-          typeof message.file === "string" ? message.file : message.file.path;
-        const uri = this.elmWorkspace + filePath;
+        const uri = this.elmWorkspace + message.file;
         const arr = acc.get(uri) || [];
         arr.push(messageToDiagnostic(message));
         acc.set(uri, arr);
