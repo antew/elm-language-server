@@ -1,14 +1,15 @@
 import {
   Diagnostic,
   DiagnosticSeverity,
-  DidOpenTextDocumentParams,
-  DidSaveTextDocumentParams,
   IConnection,
+  TextDocuments,
   PublishDiagnosticsParams,
+  TextDocumentChangeEvent,
+  DidChangeTextDocumentParams,
   Range,
 } from "vscode-languageserver";
 import URI from "vscode-uri";
-import { ElmAnalyseDiagnostics } from "./elmAnalyseDiagnostics";
+import { ElmAnalyseDiagnostics, initElmAnalyse } from "./elmAnalyseDiagnostics";
 import { ElmMakeDiagnostics } from "./elmMakeDiagnostics";
 
 export interface IElmIssueRegion {
@@ -27,75 +28,116 @@ export interface IElmIssue {
 }
 
 export class DiagnosticsProvider {
+  private documents: TextDocuments = new TextDocuments();
   private elmMakeDiagnostics: ElmMakeDiagnostics;
-  private elmAnalyseDiagnostics: ElmAnalyseDiagnostics;
+  private elmAnalyseDiagnostics: Promise<ElmAnalyseDiagnostics>;
   private connection: IConnection;
   private elmWorkspaceFolder: URI;
+  private currentDiagnostics: {
+    elmMake: Map<string, Diagnostic[]>;
+    elmAnalyse: Map<string, Diagnostic[]>;
+  };
 
   constructor(connection: IConnection, elmWorkspaceFolder: URI) {
+    this.getDiagnostics = this.getDiagnostics.bind(this);
+    this.newElmAnalyseDiagnostics = this.newElmAnalyseDiagnostics.bind(this);
+    this.elmMakeIssueToDiagnostic = this.elmMakeIssueToDiagnostic.bind(this);
+
     this.connection = connection;
     this.elmWorkspaceFolder = elmWorkspaceFolder;
     this.elmMakeDiagnostics = new ElmMakeDiagnostics(
       connection,
       elmWorkspaceFolder,
     );
-    this.elmAnalyseDiagnostics = new ElmAnalyseDiagnostics(
+
+    this.elmAnalyseDiagnostics = initElmAnalyse(
       connection,
       elmWorkspaceFolder,
+      this.newElmAnalyseDiagnostics,
     );
 
-    connection.onDidOpenTextDocument(
-      async (didTextOpenParams: DidOpenTextDocumentParams) => {
-        const uri: URI = URI.parse(didTextOpenParams.textDocument.uri);
-        this.getDiagnostics(uri);
-      },
-    );
+    this.currentDiagnostics = { elmMake: new Map(), elmAnalyse: new Map() };
 
-    connection.onDidSaveTextDocument(
-      async (didTextSaveParams: DidSaveTextDocumentParams) => {
-        const uri: URI = URI.parse(didTextSaveParams.textDocument.uri);
-        this.getDiagnostics(uri);
-      },
-    );
+    this.documents.listen(connection);
+
+    this.documents.onDidOpen(this.getDiagnostics);
+    this.documents.onDidChangeContent(this.getDiagnostics);
+    this.documents.onDidSave(this.getDiagnostics);
   }
 
-  private async getDiagnostics(fileUri: URI) {
+  private newElmAnalyseDiagnostics(diagnostics: Map<string, Diagnostic[]>) {
+    this.currentDiagnostics.elmAnalyse = diagnostics;
+    this.sendDiagnostics();
+  }
+
+  private sendDiagnostics() {
+    this.connection.console.info(
+      `before merge ${JSON.stringify(this.currentDiagnostics.elmAnalyse)}`,
+    );
+
+    const allDiagnostics: Map<string, Diagnostic[]> = new Map();
+    for (let [uri, diagnostics] of this.currentDiagnostics.elmAnalyse) {
+      allDiagnostics.set(uri, diagnostics);
+    }
+    for (let [uri, diagnostics] of this.currentDiagnostics.elmMake) {
+      allDiagnostics.set(
+        uri,
+        (allDiagnostics.get(uri) || []).concat(diagnostics),
+      );
+    }
+
+    this.connection.console.info(
+      `after merge ${JSON.stringify(allDiagnostics)}`,
+    );
+    for (let [uri, diagnostics] of allDiagnostics) {
+      this.connection.sendDiagnostics({ uri, diagnostics });
+    }
+    // this.currentDiagnostics.elmMake.forEach(diagnostic => {
+    //   this.connection.sendDiagnostics(diagnostic);
+    // });
+    // this.currentDiagnostics.elmAnalyse.forEach(diagnostic => {
+    //   this.connection.sendDiagnostics(diagnostic);
+    // });
+  }
+
+  private async getDiagnostics(change: TextDocumentChangeEvent): Promise<void> {
     const compilerErrors: IElmIssue[] = [];
+    const uri = URI.parse(change.document.uri);
+    this.connection.console.info(
+      `Parsed document uri ${uri}, original ${change.document.uri}`,
+    );
     compilerErrors.push(
-      ...(await this.elmMakeDiagnostics.createDiagnostics(fileUri)),
+      ...(await this.elmMakeDiagnostics.createDiagnostics(uri)),
+    );
+    this.connection.console.info(
+      `[elm make] got compiler errors ${JSON.stringify(compilerErrors)}`,
     );
 
-    compilerErrors.push(
-      ...(await this.elmAnalyseDiagnostics.execActivateAnalyseProcesses(
-        fileUri,
-      )),
+    const text = change.document.getText();
+    const elmAnalyse = await this.elmAnalyseDiagnostics;
+    this.connection.console.info(
+      `[elm-analyse] Updating file, text length is ${text ? text.length : 0}`,
     );
-
+    elmAnalyse.updateFile(uri, text);
     const splitCompilerErrors: Map<string, IElmIssue[]> = new Map();
 
-    compilerErrors.forEach((issue: IElmIssue) => {
-      // If provided path is relative, make it absolute
-      if (issue.file.startsWith(".")) {
-        issue.file = this.elmWorkspaceFolder + issue.file.slice(1);
-      }
-      if (splitCompilerErrors.has(issue.file)) {
-        const issuesForFile = splitCompilerErrors.get(issue.file);
-        if (issuesForFile) {
-          issuesForFile.push(issue);
+    const diagnostics: Map<string, Diagnostic[]> = compilerErrors.reduce(
+      (acc, issue) => {
+        // If provided path is relative, make it absolute
+        if (issue.file.startsWith(".")) {
+          issue.file = this.elmWorkspaceFolder + issue.file.slice(1);
         }
-      } else {
-        splitCompilerErrors.set(issue.file, [issue]);
-      }
-    });
-    const result: PublishDiagnosticsParams[] = [];
-    splitCompilerErrors.forEach((issue: IElmIssue[], issuePath: string) => {
-      result.push({
-        diagnostics: issue.map(error => this.elmMakeIssueToDiagnostic(error)),
-        uri: URI.file(issuePath).toString(),
-      });
-    });
+        const uri = URI.file(issue.file).toString();
+        const arr = acc.get(uri) || [];
+        arr.push(this.elmMakeIssueToDiagnostic(issue));
+        acc.set(uri, arr);
+        return acc;
+      },
+      new Map(),
+    );
 
-    result.forEach(diagnostic => this.connection.sendDiagnostics(diagnostic));
+    this.currentDiagnostics.elmMake = diagnostics;
+    this.sendDiagnostics();
   }
 
   private elmMakeIssueToDiagnostic(issue: IElmIssue): Diagnostic {
