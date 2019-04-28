@@ -3,13 +3,11 @@ import {
   DiagnosticSeverity,
   IConnection,
   TextDocuments,
-  PublishDiagnosticsParams,
   TextDocumentChangeEvent,
-  DidChangeTextDocumentParams,
   Range,
 } from "vscode-languageserver";
 import URI from "vscode-uri";
-import { ElmAnalyseDiagnostics, initElmAnalyse } from "./elmAnalyseDiagnostics";
+import { ElmAnalyseDiagnostics } from "./elmAnalyseDiagnostics";
 import { ElmMakeDiagnostics } from "./elmMakeDiagnostics";
 
 export interface IElmIssueRegion {
@@ -30,7 +28,7 @@ export interface IElmIssue {
 export class DiagnosticsProvider {
   private documents: TextDocuments = new TextDocuments();
   private elmMakeDiagnostics: ElmMakeDiagnostics;
-  private elmAnalyseDiagnostics: Promise<ElmAnalyseDiagnostics>;
+  private elmAnalyseDiagnostics: ElmAnalyseDiagnostics;
   private connection: IConnection;
   private elmWorkspaceFolder: URI;
   private currentDiagnostics: {
@@ -50,7 +48,7 @@ export class DiagnosticsProvider {
       elmWorkspaceFolder,
     );
 
-    this.elmAnalyseDiagnostics = initElmAnalyse(
+    this.elmAnalyseDiagnostics = new ElmAnalyseDiagnostics(
       connection,
       elmWorkspaceFolder,
       this.newElmAnalyseDiagnostics,
@@ -114,12 +112,10 @@ export class DiagnosticsProvider {
     );
 
     const text = change.document.getText();
-    const elmAnalyse = await this.elmAnalyseDiagnostics;
     this.connection.console.info(
       `[elm-analyse] Updating file, text length is ${text ? text.length : 0}`,
     );
-    elmAnalyse.updateFile(uri, text);
-    const splitCompilerErrors: Map<string, IElmIssue[]> = new Map();
+    this.elmAnalyseDiagnostics.updateFile(uri, text);
 
     const diagnostics: Map<string, Diagnostic[]> = compilerErrors.reduce(
       (acc, issue) => {

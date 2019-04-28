@@ -15,60 +15,54 @@ interface NewDiagnosticsCallback {
   (diagnostics: Map<string, Diagnostic[]>): void;
 }
 
-export async function initElmAnalyse(
-  connection: IConnection,
-  elmWorkspace: URI,
-  onNewDiagnostics: NewDiagnosticsCallback,
-) {
-  const elmJson = await readFile(path.join(elmWorkspace.fsPath, "elm.json"), {
-    encoding: "utf-8",
-  });
-  const fileLoadingPorts = require("elm-analyse/dist/app/file-loading-ports.js");
-  const { Elm } = require("elm-analyse/dist/app/backend-elm.js");
-  const elmAnalyse = Elm.Analyser.init({
-    flags: {
-      project: elmJson,
-      registry: [],
-      server: false,
-    },
-  });
-
-  fileLoadingPorts.setup(elmAnalyse, {}, elmWorkspace.fsPath);
-  return new ElmAnalyseDiagnostics(
-    connection,
-    elmWorkspace,
-    elmAnalyse,
-    onNewDiagnostics,
-  );
-}
-
 export class ElmAnalyseDiagnostics {
   private connection: IConnection;
   private elmWorkspace: URI;
-  private elmAnalyse: ElmApp;
+  private elmAnalyse: Promise<ElmApp>;
   private filesWithDiagnostics = new Set();
   private onNewDiagnostics: NewDiagnosticsCallback;
 
   constructor(
     connection: IConnection,
     elmWorkspace: URI,
-    elmAnalyse: ElmApp,
     onNewDiagnostics: NewDiagnosticsCallback,
   ) {
     this.connection = connection;
     this.elmWorkspace = elmWorkspace;
-    this.elmAnalyse = elmAnalyse;
     this.onNewDiagnostics = onNewDiagnostics;
 
-    this.elmAnalyse.ports.sendReportValue.subscribe(this.onNewReport);
+    this.elmAnalyse = this.setupElmAnalyse();
+  }
+
+  private async setupElmAnalyse() {
+    const fsPath = this.elmWorkspace.fsPath;
+    const elmJson = await readFile(path.join(fsPath, "elm.json"), {
+      encoding: "utf-8",
+    });
+    const fileLoadingPorts = require("elm-analyse/dist/app/file-loading-ports.js");
+    const { Elm } = require("elm-analyse/dist/app/backend-elm.js");
+    const elmAnalyse = Elm.Analyser.init({
+      flags: {
+        project: elmJson,
+        registry: [],
+        server: false,
+      },
+    });
+
+    fileLoadingPorts.setup(elmAnalyse, {}, this.elmWorkspace.fsPath);
+    elmAnalyse.ports.sendReportValue.subscribe(this.onNewReport);
+
+    return elmAnalyse;
   }
 
   public updateFile = (uri: URI, text?: string) => {
-    this.connection.console.info(`[elm-analyse] updating file ${uri}`);
-    this.elmAnalyse.ports.fileWatch.send({
-      content: text || null,
-      event: "update",
-      file: path.relative(this.elmWorkspace.fsPath, uri.path),
+    this.elmAnalyse.then(elmAnalyse => {
+      this.connection.console.info(`[elm-analyse] updating file ${uri}`);
+      elmAnalyse.ports.fileWatch.send({
+        content: text || null,
+        event: "update",
+        file: path.relative(this.elmWorkspace.fsPath, uri.path),
+      });
     });
   };
 
@@ -79,7 +73,6 @@ export class ElmAnalyseDiagnostics {
     // each file and sends them as a batch
     const diagnostics: Map<string, Diagnostic[]> = report.messages.reduce(
       (acc, message) => {
-        this.connection.console.info(`Reducing diagnostics on ${message.file}`);
         const filePath =
           typeof message.file === "string" ? message.file : message.file.path;
         const uri = this.elmWorkspace + filePath;
@@ -90,7 +83,7 @@ export class ElmAnalyseDiagnostics {
       },
       new Map(),
     );
-    const filesInReport = new Set(Object.keys(diagnostics));
+    const filesInReport = new Set(diagnostics.keys());
     const filesThatAreNowFixed = new Set(
       [...this.filesWithDiagnostics].filter(
         uriPath => !filesInReport.has(uriPath),
